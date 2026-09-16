@@ -76,7 +76,7 @@ export async function ensureYtDlp() {
 }
 
 /** Lance yt-dlp avec une liste d'arguments (pas de shell → pas d'injection). */
-function run(args, timeoutMs = 90_000) {
+function run(args, timeoutMs = 180_000) {
   return new Promise((resolve, reject) => {
     const proc = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
@@ -171,7 +171,13 @@ async function tryFallbackApi(url) {
     })
     const j = await res.json().catch(() => null)
     if (!j?.success) return null
-    const video = j.mp4 || j.video || j.medias?.find((m) => m?.type === 'video')?.url
+    // L'API renvoie : { mp4 } OU { video } OU { medias: [{label, url}] }
+    const video =
+      j.mp4 ||
+      j.video ||
+      j.medias?.find((m) => m?.type === 'video')?.url ||
+      j.medias?.find((m) => /video|mp4/i.test(`${m?.label || ''} ${m?.url || ''}`))?.url ||
+      j.medias?.[0]?.url
     if (!video) return null
     const dest = path.join(DL_DIR, `api_${Date.now()}.mp4`)
     const r = await fetchToFile(video, dest, MAX_SIZE)
@@ -204,6 +210,8 @@ export async function downloadVideo(url) {
         '-f', fmt,
         '--no-playlist',
         '--no-warnings',
+        '--retries', '3',
+        '--socket-timeout', '20',
         '-o', path.join(DL_DIR, '%(id)s.%(ext)s'),
         '--print', 'after_move:filepath',
         '--print', 'after_move:title',
@@ -227,9 +235,9 @@ export async function downloadVideo(url) {
     } catch (err) {
       const msg = String(err?.message || '')
       lastError = err
-      // Erreur "réelle" (lien invalide, vidéo privée, site non supporté,
-      // blocage anti-bot…) → on stoppe l'échelle de formats
-      if (/unsupported url|private video|is not a valid URL|Inappropriate|not exist|unable to extract|is an unsupported|timeout|Sign in to confirm/i.test(msg)) {
+      // Erreur "réelle" (lien invalide, vidéo privée/indisponible, site non
+      // supporté, blocage anti-bot…) → on stoppe l'échelle de formats
+      if (/unsupported url|private video|is not a valid URL|Inappropriate|not exist|unavailable|removed|deleted|private|unable to extract|is an unsupported|timeout|Sign in to confirm|login (is )?(required|needed)|blocked by/i.test(msg)) {
         break
       }
     }
