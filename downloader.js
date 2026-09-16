@@ -350,3 +350,38 @@ export async function downloadVideo(url) {
 
   throw lastError || new Error('Échec du téléchargement')
 }
+
+/**
+ * Télécharge un flux HLS (m3u8) résolu directement — ex. anime via AniPub
+ * quand le CDN laisse passer.
+ * @returns {Promise<{path,title,size} | {tooBig:true,url}>}
+ */
+export async function downloadHls(m3u8Url, title = '') {
+  await ensureYtDlp()
+  try {
+    const { out } = await run(
+      [
+        ...(FFMPEG_PATH ? ['--ffmpeg-location', FFMPEG_PATH] : []),
+        '-f', 'bv*+ba/b',
+        '--no-playlist',
+        '--no-warnings',
+        '--retries', '3',
+        '--socket-timeout', '30',
+        '-o', path.join(DL_DIR, 'anipub_%(id)s.%(ext)s'),
+        '--print', 'after_move:filepath',
+        m3u8Url,
+      ],
+      600_000
+    )
+    const filePath = out.trim().split('\n')[0].trim()
+    if (!filePath || !fs.existsSync(filePath)) throw new Error('Fichier introuvable après téléchargement')
+    const size = fs.statSync(filePath).size
+    if (size > DOC_LIMIT) {
+      fs.rmSync(filePath, { force: true })
+      return { tooBig: true, url: m3u8Url }
+    }
+    return { path: filePath, title, size }
+  } catch (err) {
+    throw new Error(String(err?.message || err))
+  }
+}

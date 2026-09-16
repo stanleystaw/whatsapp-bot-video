@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { sendMessage, sendVideo, sendDocument } from './whatsapp.js'
-import { searchVideos, downloadVideo, VIDEO_LIMIT } from './downloader.js'
+import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT } from './downloader.js'
+import { anipubSearch, anipubEpisodeId, anipubResolveMedia } from './anipub.js'
 
 // Recherches en attente : jid -> { results, ts } (expirées après 10 min)
 const pending = new Map()
@@ -24,7 +25,10 @@ function helpText() {
     '• **Lien direct** : colle un lien et je télécharge la vidéo',
     '  (YouTube, TikTok, Facebook, Instagram, X, Dailymotion, Vimeo…)',
     '',
-    '• **Anime VF** : `a nom` → je cherche les épisodes en VO/Français',
+    '• **Anime (AniPub)** : envoie un lien anipub.xyz (recherche ou épisode)',
+    '  Ex : le lien de recherche de ton anime, puis choisis le numéro',
+    '',
+    '• **Anime VF** : `a nom` → je cherche les épisodes sur YouTube',
     '  Ex : `a one piece` puis `3`',
     '',
     '• **Recherche** : `s mot-clé` → je liste 5 résultats YouTube,',
@@ -59,10 +63,23 @@ export async function handleMessage(from, text) {
   }
 
   // --- 1) Numéro de résultat (après une recherche) --------------------
-  if (pending.has(from) && /^\d{1,2}$/.test(t)) {
+  if (pending.has(from) && /^\d{1,3}$/.test(t)) {
     const p = pending.get(from)
-    if (Date.now() - p.ts > PENDING_TTL) pending.delete(from)
-    else {
+    if (Date.now() - p.ts > PENDING_TTL) {
+      pending.delete(from)
+    } else if (p.kind === 'anipub-ep') {
+      const n = parseInt(t, 10)
+      if (n < 1 || n > p.epCount) return sendMessage(from, `Entre 1 et ${p.epCount}.`)
+      pending.delete(from)
+      return anipubTryDownload(from, p.finder, n, p.name)
+    } else if (p.kind === 'anipub-search') {
+      const r = p.results[parseInt(t, 10) - 1]
+      if (!r) return sendMessage(from, `Choisis un numéro entre 1 et ${p.results.length}.`)
+      pending.delete(from)
+      if (!r.epCount || r.epCount <= 1) return anipubTryDownload(from, r.finder || String(r.id), 1, r.name)
+      pending.set(from, { kind: 'anipub-ep', finder: r.finder, name: r.name, epCount: r.epCount, ts: Date.now() })
+      return sendMessage(from, `🎌 ${r.name} — ${r.epCount} épisodes.\nQuel numéro d'épisode veux-tu ? (ex : 1)`)
+    } else {
       const r = p.results[parseInt(t, 10) - 1]
       if (r) return downloadAndSend(from, r.url, r.title)
       return sendMessage(from, `Choisis un numéro entre 1 et ${p.results.length}.`)
@@ -73,6 +90,7 @@ export async function handleMessage(from, text) {
   const urlMatch = text.match(URL_RE)
   if (urlMatch) {
     const url = urlMatch[0].replace(/[).,;!?]+$/, '')
+    if (/anipub\.xyz/i.test(url)) return anipubUrl(from, url)
     return downloadAndSend(from, url)
   }
 
@@ -108,6 +126,103 @@ async function doSearch(from, q, emoji = '🔍') {
     )
   } catch (err) {
     await sendMessage(from, `⚠️ Recherche impossible : ${err.message}`)
+  }
+}
+
+// ---------------------------------------------------------------------
+// AniPub (anime) — liens de recherche / épisodes
+// ---------------------------------------------------------------------
+async function anipubUrl(from, url) {
+  try {
+    const u = new URL(url)
+    // 1) Page de recherche : /search/q?query=Naruto
+    if (u.pathname.startsWith('/search/')) {
+      const q = u.searchParams.get('query') || u.searchParams.get('q')
+      if (!q) return sendMessage(from, 'Lien de recherche sans requête — tape plutôt `a <anime>` pour chercher.')
+      return anipubSearchFlow(from, q)
+    }
+    // 2) Page player : /AniPlayer/<slug|id>/<episode>
+    const m = u.pathname.match(/\/AniPlayer\/([^/]+)\/(\d+)/)
+    if (m) return anipubTryDownload(from, m[1], parseInt(m[2], 10) + 1)
+    // 3) Page vidéo directe : /video/<id>/<type>
+    const m2 = u.pathname.match(/\/video\/(\d+)\/(sub|dub)/)
+    if (m2) return anipubTryDownloadDirect(from, m2[1])
+    return sendMessage(from, 'Je ne reconnais pas ce lien AniPub.\nEnvoie un lien de recherche (anipub.xyz/search/…) ou d\'épisode (anipub.xyz/AniPlayer/…), ou tape `a <anime>`.')
+  } catch (err) {
+    return sendMessage(from, `⚠️ Erreur AniPub : ${err.message}`)
+  }
+}
+
+async function anipubSearchFlow(from, q) {
+  try {
+    const results = await anipubSearch(q)
+    if (!results.length) return sendMessage(from, `Aucun anime trouvé pour « ${q} » sur AniPub.`)
+    pending.set(from, { kind: 'anipub-search', results, ts: Date.now() })
+    const lines = results.map(
+      (r, i) => `${i + 1}. ${r.name}${r.epCount ? ` (${r.epCount} ép.)` : ''}${r.score ? ` ⭐ ${r.score}` : ''}`
+    )
+    await sendMessage(
+      from,
+      `🎌 AniPub — « ${q} » :\n\n${lines.join('\n')}\n\nRéponds avec le numéro (1-${results.length}). ⏱️ (10 min)`
+    )
+  } catch (err) {
+    return sendMessage(from, `⚠️ Recherche AniPub impossible : ${err.message}`)
+  }
+}
+
+async function anipubTryDownloadDirect(from, gogoId) {
+  try {
+    const media = await anipubResolveMedia(gogoId)
+    if (!media.ok) {
+      return sendMessage(
+        from,
+        `⚠️ Le CDN d'AniPub bloque les téléchargements depuis le serveur (${media.why}).\n` +
+          `C'est leur anti-bot Cloudflare : il laisse passer les connexions "résidentielles" (ton téléphone) mais pas les serveurs.\n\n` +
+          `Options :\n` +
+          `• 📱 Regarder sur ton téléphone (le lien que tu m'as envoyé)\n` +
+          `• 🎬 Chercher sur YouTube : a <nom de l'anime> ep <numéro>\n` +
+          `• Crunchyroll si tu as un compte : envoie le lien crunchyroll.com`
+      )
+    }
+    const dl = await downloadHls(media.m3u8, 'Vidéo AniPub')
+    if (dl.tooBig) return sendMessage(from, '⚠️ Trop volumineux même en fichier (max ~180 Mo).')
+    const ext = path.extname(dl.path).slice(1).toLowerCase()
+    const mime = MIME_BY_EXT[ext] || 'video/mp4'
+    await sendDocument(from, dl.path, mime, `Vidéo AniPub (${Math.round(dl.size / 1048576)} Mo)`)
+    fs.rmSync(dl.path, { force: true })
+  } catch (err) {
+    return sendMessage(from, `⚠️ Erreur AniPub : ${err.message}`)
+  }
+}
+
+async function anipubTryDownload(from, finder, epNumber, name = '') {
+  try {
+    await sendMessage(from, '⏳ Je cherche le flux de l\u2019épisode…')
+  } catch {}
+  try {
+    const ep = await anipubEpisodeId(finder, epNumber - 1)
+    if (!ep) return sendMessage(from, `⚠️ Épisode ${epNumber} introuvable sur AniPub.`)
+    const media = await anipubResolveMedia(ep.gogoId)
+    if (!media.ok) {
+      const watch = `https://anipub.xyz/AniPlayer/${finder}/${epNumber - 1}`
+      return sendMessage(
+        from,
+        `⚠️ Le CDN d'AniPub bloque les téléchargements depuis le serveur (${media.why}).\n` +
+          `C'est leur anti-bot Cloudflare : il laisse passer ton téléphone mais pas les serveurs — ce n'est pas un bug du bot.\n\n` +
+          `${name ? name + ' — ' : ''}épisode ${epNumber} :\n` +
+          `• 📱 Regarder/télécharger sur ton téléphone : ${watch}\n` +
+          `• 🎬 Chercher sur YouTube : a ${name || 'cet anime'} ep ${epNumber}\n` +
+          `• Crunchyroll si tu as un compte : envoie le lien crunchyroll.com`
+      )
+    }
+    const dl = await downloadHls(media.m3u8, `${name} — épisode ${epNumber}`.trim())
+    if (dl.tooBig) return sendMessage(from, '⚠️ Trop volumineux même en fichier (max ~180 Mo).')
+    const ext = path.extname(dl.path).slice(1).toLowerCase()
+    const mime = MIME_BY_EXT[ext] || 'video/mp4'
+    await sendDocument(from, dl.path, mime, `${name ? name + ' — ' : ''}épisode ${epNumber} (${Math.round(dl.size / 1048576)} Mo)`)
+    fs.rmSync(dl.path, { force: true })
+  } catch (err) {
+    await sendMessage(from, `⚠️ Erreur AniPub : ${err.message}`)
   }
 }
 
