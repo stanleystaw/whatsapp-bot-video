@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: whatsapp-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    # À définir dans le dashboard (onglet Environment) :
+    #   MY_PHONE_NUMBER  → ton numéro international sans +
+    #   PAIR_SECRET      → clé de /pair, /backup, /restore
+    #   AUTH_DIR         → (optionnel) chemin du disque attaché, ex. /auth
+    #   ALLOWED_FROM     → (optionnel) liste blanche de numéros
+    #
+    # Pour conserver la session entre les déploiements :
+    #   Dashboard → Disks → attacher un disque sur /auth + AUTH_DIR=/auth
