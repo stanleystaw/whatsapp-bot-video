@@ -42,6 +42,9 @@ const silent = pino({ level: 'silent' })
 export const isLinked = () => Boolean(state?.creds?.registered)
 /** Le socket est-il connecté (WebSocket ouvert) ? */
 export const isConnected = () => connected
+/** État RÉEL du WebSocket (ouvert même pendant la phase QR,
+ * avant que l'événement 'open' de Baileys ne soit émis). */
+export const isWsAlive = () => Boolean(sock?.ws?.isOpen)
 /** Dernier code d'appairage généré (sinon null) */
 export const getPairingCode = () => pairingCode
 /** Dernier payload QR (pour l'afficher scannable) */

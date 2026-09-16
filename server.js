@@ -8,6 +8,7 @@ import {
   init,
   isLinked,
   isConnected,
+  isWsAlive,
   getPairingCode,
   getLatestQr,
   requestNewPairingCode,
@@ -51,7 +52,7 @@ app.get('/', (req, res) => {
   const conn = isConnected()
   const code = getPairingCode()
   const rows = [
-    ['Connexion WhatsApp', conn ? '✅ WebSocket ouvert' : '🔌 En reconnexion (auto, ~30 s)'],
+    ['Connexion WhatsApp', isWsAlive() ? '✅ WebSocket ouvert' : '🔌 En reconnexion (auto, ~30 s)'],
     ['Liaison au compte', linked ? '✅ Lié au compte WhatsApp' : '🔴 Non lié'],
     [
       'Code d’appairage',
