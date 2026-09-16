@@ -12,6 +12,7 @@ import {
   authDir,
   restart,
   resetAuth,
+  getDiagnostics,
 } from './whatsapp.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -32,6 +33,13 @@ function guard(req, res, next) {
   if (req.query.key === PAIR_SECRET || req.get('x-pair-secret') === PAIR_SECRET) return next()
   res.status(403).send('Clé requise : /pair?key=' + PAIR_SECRET)
 }
+
+// ---------------------------------------------------------------------
+// /status : diagnostic JSON (pour savoir exactement ce qui bloque)
+// ---------------------------------------------------------------------
+app.get('/status', guard, (req, res) => {
+  res.json(getDiagnostics())
+})
 
 // ---------------------------------------------------------------------
 // Page d'accueil (état du bot)

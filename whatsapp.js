@@ -31,6 +31,8 @@ let stopping = false
 let pairingCode = null
 let connected = false // socket WebSocket ouvert ?
 let rebuilding = false // watchdog : reconstruction en cours ?
+let buildStartedAt = 0 // horodatage du build en cours (anti-blocage)
+let lastCloseStatus = null // dernier status de fermeture (diagnostic)
 
 const silent = pino({ level: 'silent' })
 
@@ -41,6 +43,32 @@ export const isConnected = () => connected
 /** Dernier code d'appairage généré (sinon null) */
 export const getPairingCode = () => pairingCode
 export const authDir = () => AUTH_DIR
+
+/** État détaillé pour le diagnostic (endpoint /status). */
+export function getDiagnostics() {
+  return {
+    time: new Date().toISOString(),
+    linked: isLinked(),
+    connected,
+    wsState: sock?.ws
+      ? sock.ws.isOpen
+        ? 'open'
+        : sock.ws.isConnecting
+          ? 'connecting'
+          : sock.ws.isClosing
+            ? 'closing'
+            : 'closed'
+      : null,
+    pairingCodeReady: Boolean(pairingCode),
+    myPhoneSet: MY_PHONE.length > 0,
+    myPhone: MY_PHONE ? MY_PHONE.replace(/^(\d{3})\d+(\d{3})$/, '$1 *** $2') : null,
+    rebuilding,
+    lastCloseStatus,
+    authDir: AUTH_DIR,
+    hasAuth: fs.existsSync(AUTH_DIR),
+    uptimeSec: Math.round(process.uptime()),
+  }
+}
 
 const MIMES = {
   mp4: 'video/mp4',
@@ -86,12 +114,13 @@ export async function sendVideo(to, filePath, caption = '') {
  */
 export async function requestNewPairingCode(timeoutMs = 20_000) {
   if (!MY_PHONE) throw new Error('MY_PHONE_NUMBER non défini dans les variables d’environnement')
+  // Baileys v7 : sock.ws est un wrapper → properties isOpen/isConnecting/isClosed
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (sock?.ws?.readyState === 1) break
+    if (sock?.ws?.isOpen) break
     await new Promise((r) => setTimeout(r, 1500))
   }
-  if (!sock || sock.ws?.readyState !== 1) {
+  if (!sock?.ws?.isOpen) {
     throw new Error('Service en reconnexion (réveil du serveur) — rechargez /pair dans 30 s')
   }
   pairingCode = await sock.requestPairingCode(MY_PHONE)
@@ -104,7 +133,7 @@ async function buildSocket() {
 
   let version
   try {
-    ;({ version } = await fetchLatestBaileysVersion())
+    ;({ version } = await fetchLatestBaileysVersion({ signal: AbortSignal.timeout(10_000) }))
   } catch {
     version = FALLBACK_VERSION
   }
@@ -143,6 +172,7 @@ async function buildSocket() {
       }
     } else if (connection === 'close') {
       connected = false
+      lastCloseStatus = status ?? 'inconnu'
       if (status === DisconnectReason.loggedOut) {
         console.log('👋 Déconnexion (loggedOut) : réinitialisation de la session')
         try {
@@ -236,10 +266,22 @@ export async function resetAuth() {
 // ---------------------------------------------------------------------
 setInterval(() => {
   if (stopping) return
-  const st = sock?.ws?.readyState // 0=CONNECTING 1=OPEN 2/3=EN TRAIN DE FERMER/FERMÉ
-  if (sock && (st === 0 || st === 1)) return // en cours ou ouvert → on n'y touche pas
-  if (rebuilding) return
+  const ws = sock?.ws
+  // Baileys v7 : wrapper avec isOpen / isConnecting / isClosed / isClosing
+  const active = Boolean(ws && (ws.isOpen || ws.isConnecting))
+  if (sock && active) return // en cours ou ouvert → on n'y touche pas
+  if (rebuilding) {
+    // Build précédent bloqué depuis plus de 90 s (fetch version, réseau…)
+    // → on le considère mort et on relance.
+    if (Date.now() - buildStartedAt > 90_000) {
+      console.log('⚠️ Watchdog : build précédent bloqué (>90 s) — forçage du retry')
+      rebuilding = false
+    } else {
+      return
+    }
+  }
   rebuilding = true
+  buildStartedAt = Date.now()
   console.log('🩺 Watchdog : socket absent ou fermé — reconstruction de la connexion…')
   try {
     sock?.end()
