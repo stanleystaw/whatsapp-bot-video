@@ -271,6 +271,24 @@ function walkAuth(dir, base = dir, out = {}) {
   return out
 }
 
+// Configuration runtime (proxy AniPub) — survit jusqu'au prochain deploy
+app.post('/config', guard, (req, res) => {
+  try {
+    const { anipubProxy, anipubSecret } = req.body || {}
+    const p = path.join(__dirname, 'config.json')
+    let cur = {}
+    try {
+      cur = JSON.parse(fs.readFileSync(p, 'utf8'))
+    } catch {}
+    if (typeof anipubProxy === 'string') cur.anipubProxy = anipubProxy
+    if (typeof anipubSecret === 'string') cur.anipubSecret = anipubSecret
+    fs.writeFileSync(p, JSON.stringify(cur, null, 2))
+    res.json({ ok: true, anipubProxy: cur.anipubProxy ? cur.anipubProxy.slice(0, 45) + '…' : null })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.get('/backup', guard, (req, res) => {
   const dir = authDir()
   if (!fs.existsSync(dir)) {

@@ -1,8 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { sendMessage, sendVideo, sendDocument } from './whatsapp.js'
-import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT } from './downloader.js'
-import { anipubSearch, anipubEpisodeId, anipubResolveMedia } from './anipub.js'
+import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT, DL_DIR } from './downloader.js'
+import { anipubSearch, anipubEpisodeId, anipubResolveMedia, anipubBuildPlaylist } from './anipub.js'
 
 // Recherches en attente : jid -> { results, ts } (expirées après 10 min)
 const pending = new Map()
@@ -184,7 +184,8 @@ async function anipubTryDownloadDirect(from, gogoId) {
           `• Crunchyroll si tu as un compte : envoie le lien crunchyroll.com`
       )
     }
-    const dl = await downloadHls(media.m3u8, 'Vidéo AniPub')
+    const playlist = await anipubBuildPlaylist(media.m3u8, DL_DIR)
+    const dl = await downloadHls(playlist, 'Vidéo AniPub')
     if (dl.tooBig) return sendMessage(from, '⚠️ Trop volumineux même en fichier (max ~180 Mo).')
     const ext = path.extname(dl.path).slice(1).toLowerCase()
     const mime = MIME_BY_EXT[ext] || 'video/mp4'
@@ -215,7 +216,8 @@ async function anipubTryDownload(from, finder, epNumber, name = '') {
           `• Crunchyroll si tu as un compte : envoie le lien crunchyroll.com`
       )
     }
-    const dl = await downloadHls(media.m3u8, `${name} — épisode ${epNumber}`.trim())
+    const playlist = await anipubBuildPlaylist(media.m3u8, DL_DIR)
+    const dl = await downloadHls(playlist, `${name} — épisode ${epNumber}`.trim())
     if (dl.tooBig) return sendMessage(from, '⚠️ Trop volumineux même en fichier (max ~180 Mo).')
     const ext = path.extname(dl.path).slice(1).toLowerCase()
     const mime = MIME_BY_EXT[ext] || 'video/mp4'

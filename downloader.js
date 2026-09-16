@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const BIN = path.join(__dirname, 'bin', 'yt-dlp')
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp'
 // Dossier de travail temporaire (effacé à chaque redémarrage du service)
-const DL_DIR = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'wabo-'))
+export const DL_DIR = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'wabo-'))
 // ≤ 15 Mo : envoyé comme VIDÉO (lecture directe) ;
 // > 15 Mo : envoyé comme FICHIER (document) — épisode complet d'anime OK.
 export const VIDEO_LIMIT = 15 * 1024 * 1024
