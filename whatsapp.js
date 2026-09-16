@@ -30,6 +30,7 @@ let state = null
 let stopping = false
 let pairingCode = null
 let latestQr = null // dernier payload QR émis par Baileys (rotation ~20 s)
+let qrSeen = 0 // nombre de QR observés (diagnostic)
 let connected = false // socket WebSocket ouvert ?
 let rebuilding = false // watchdog : reconstruction en cours ?
 let buildStartedAt = 0 // horodatage du build en cours (anti-blocage)
@@ -62,6 +63,9 @@ export function getDiagnostics() {
             ? 'closing'
             : 'closed'
       : null,
+    hasQr: Boolean(latestQr),
+    qrSeen,
+    hasMe: Boolean(state?.creds?.me),
     pairingCodeReady: Boolean(pairingCode),
     myPhoneSet: MY_PHONE.length > 0,
     myPhone: MY_PHONE ? MY_PHONE.replace(/^(\d{3})\d+(\d{3})$/, '$1 *** $2') : null,
@@ -158,7 +162,11 @@ async function buildSocket() {
     const status = lastDisconnect?.error?.output?.statusCode
 
     // Baileys émet le QR automatiquement (rotation ~20 s) quand non lié
-    if (qr) latestQr = qr
+    if (qr) {
+      latestQr = qr
+      qrSeen++
+      console.log('📷 QR émis (n°' + qrSeen + ') — scannable sur /qr')
+    }
 
     if (connection === 'open') {
       connected = true

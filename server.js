@@ -182,7 +182,16 @@ app.get('/qr', guard, async (req, res) => {
   }
   const qr = getLatestQr()
   if (!qr || !isConnected()) {
-    return res.status(503).send('QR non disponible — le service se reconnecte, rechargez dans 30 s')
+    return res.status(503).send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="20">
+<title>QR — en attente</title></head>
+<body style="font-family:system-ui;background:#0b141a;color:#e9edef;display:flex;
+justify-content:center;padding:40px 16px">
+<div style="background:#111b21;border-radius:16px;padding:32px;max-width:480px;width:100%">
+  <h1 style="margin-top:0">⏳ QR en attente…</h1>
+  <p>Le bot se connecte ou le QR se régénère. Cette page se recharge toute seule
+  (toutes les 20 s).</p>
+</div></body></html>`)
   }
   try {
     const dataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 1, errorCorrectionLevel: 'M' })
