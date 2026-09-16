@@ -28,13 +28,16 @@ const FALLBACK_VERSION = [2, 3000, 100]
 let sock = null
 let state = null
 let stopping = false
-let reconnectAttempts = 0
 let pairingCode = null
+let connected = false // socket WebSocket ouvert ?
+let rebuilding = false // watchdog : reconstruction en cours ?
 
 const silent = pino({ level: 'silent' })
 
 /** Le bot est-il lié au compte WhatsApp ? */
 export const isLinked = () => Boolean(state?.creds?.registered)
+/** Le socket est-il connecté (WebSocket ouvert) ? */
+export const isConnected = () => connected
 /** Dernier code d'appairage généré (sinon null) */
 export const getPairingCode = () => pairingCode
 export const authDir = () => AUTH_DIR
@@ -76,10 +79,21 @@ export async function sendVideo(to, filePath, caption = '') {
   })
 }
 
-/** Demande un nouveau code d'appairage au serveur WhatsApp. */
-export async function requestNewPairingCode() {
-  if (!sock) throw new Error('Socket non initialisé')
+/**
+ * Demande un code d'appairage au serveur WhatsApp.
+ * Attend d'abord que le socket soit ouvert (après un réveil du service,
+ * la reconnexion peut prendre quelques secondes).
+ */
+export async function requestNewPairingCode(timeoutMs = 20_000) {
   if (!MY_PHONE) throw new Error('MY_PHONE_NUMBER non défini dans les variables d’environnement')
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (sock?.ws?.readyState === 1) break
+    await new Promise((r) => setTimeout(r, 1500))
+  }
+  if (!sock || sock.ws?.readyState !== 1) {
+    throw new Error('Service en reconnexion (réveil du serveur) — rechargez /pair dans 30 s')
+  }
   pairingCode = await sock.requestPairingCode(MY_PHONE)
   return pairingCode
 }
@@ -108,26 +122,27 @@ async function buildSocket() {
   // Persiste la session à chaque mise à jour (crucial après l'appairage)
   s.ev.on('creds.update', sc)
 
-  s.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+  s.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     const status = lastDisconnect?.error?.output?.statusCode
 
     if (connection === 'open') {
-      reconnectAttempts = 0
+      connected = true
       if (!state.creds.registered) {
         if (!MY_PHONE) {
           console.error('⚠️ Session non liée et MY_PHONE_NUMBER absent — impossible de demander un code.')
           return
         }
-        try {
-          pairingCode = await s.requestPairingCode(MY_PHONE)
-          console.log('🔑 Code d’appairage généré (visitez /pair)')
-        } catch (err) {
-          console.error('❌ Erreur lors de la génération du code :', err.message)
-        }
+        s.requestPairingCode(MY_PHONE)
+          .then((code) => {
+            pairingCode = code
+            console.log('🔑 Code d’appairage généré (visitez /pair)')
+          })
+          .catch((err) => console.error('❌ Erreur lors de la génération du code :', err.message))
       } else {
         console.log('✅ Connecté et lié au compte WhatsApp')
       }
     } else if (connection === 'close') {
+      connected = false
       if (status === DisconnectReason.loggedOut) {
         console.log('👋 Déconnexion (loggedOut) : réinitialisation de la session')
         try {
@@ -135,20 +150,11 @@ async function buildSocket() {
         } catch {}
         state = null
         pairingCode = null
+      } else {
+        console.log(`⚠️ Connexion fermée (status ${status ?? 'inconnu'}) — le watchdog relancera la reconnexion`)
       }
-      if (!stopping) {
-        reconnectAttempts += 1
-        const delay = Math.min(30_000, 2000 * reconnectAttempts)
-        console.log(`⏳ Reconnexion dans ${Math.round(delay / 1000)} s (tentative ${reconnectAttempts})`)
-        setTimeout(() => {
-          if (stopping) return
-          buildSocket()
-            .then((s2) => {
-              sock = s2
-            })
-            .catch((err) => console.error('❌ Échec de la reconnexion :', err.message))
-        }, delay)
-      }
+      // La reconnexion est gérée par le watchdog ci-dessous (une seule
+      // mécanique, sans risque de double socket).
     }
   })
 
@@ -207,3 +213,43 @@ export async function restart() {
   sock = null
   await init()
 }
+
+/** Efface la session (appairage) et relance le socket — endpoint /reset. */
+export async function resetAuth() {
+  stopping = false
+  try {
+    sock?.end()
+  } catch {}
+  try {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+  } catch {}
+  state = null
+  pairingCode = null
+  connected = false
+  sock = null
+  await init()
+}
+
+// ---------------------------------------------------------------------
+// 🩺 Watchdog : si le socket meurt (sommeil Render, coupure réseau,
+// gel du process…), on reconstruit la connexion toutes les 10 s.
+// ---------------------------------------------------------------------
+setInterval(() => {
+  if (stopping) return
+  const st = sock?.ws?.readyState // 0=CONNECTING 1=OPEN 2/3=EN TRAIN DE FERMER/FERMÉ
+  if (sock && (st === 0 || st === 1)) return // en cours ou ouvert → on n'y touche pas
+  if (rebuilding) return
+  rebuilding = true
+  console.log('🩺 Watchdog : socket absent ou fermé — reconstruction de la connexion…')
+  try {
+    sock?.end()
+  } catch {}
+  buildSocket()
+    .then((s2) => {
+      sock = s2
+    })
+    .catch((err) => console.error('❌ Watchdog : échec de reconstruction :', err.message))
+    .finally(() => {
+      rebuilding = false
+    })
+}, 10_000)

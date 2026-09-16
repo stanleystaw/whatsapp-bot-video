@@ -6,10 +6,12 @@ import express from 'express'
 import {
   init,
   isLinked,
+  isConnected,
   getPairingCode,
   requestNewPairingCode,
   authDir,
   restart,
+  resetAuth,
 } from './whatsapp.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -36,9 +38,11 @@ function guard(req, res, next) {
 // ---------------------------------------------------------------------
 app.get('/', (req, res) => {
   const linked = isLinked()
+  const conn = isConnected()
   const code = getPairingCode()
   const rows = [
-    ['Connexion', linked ? '✅ Lié au compte WhatsApp' : '🔴 Non lié'],
+    ['Connexion WhatsApp', conn ? '✅ WebSocket ouvert' : '🔌 En reconnexion (auto, ~30 s)'],
+    ['Liaison au compte', linked ? '✅ Lié au compte WhatsApp' : '🔴 Non lié'],
     [
       'Code d’appairage',
       linked ? '—' : code ? '✅ disponible ci-dessous' : '⏳ en attente de la connexion…',
@@ -49,23 +53,25 @@ app.get('/', (req, res) => {
     .join('')
   res.send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
 <title>Bot WhatsApp</title></head>
 <body style="font-family:system-ui,-apple-system,sans-serif;background:#0b141a;color:#e9edef;
 display:flex;justify-content:center;padding:40px 16px">
 <div style="background:#111b21;border-radius:16px;padding:32px;max-width:520px;width:100%">
   <h1 style="margin-top:0">🤖 Bot WhatsApp</h1>
-  <p style="color:#8696a0">Serveur en ligne — protocole multi-appareils (Baileys).</p>
+  <p style="color:#8696a0">Serveur en ligne — protocole multi-appareils (Baileys). Page auto-rechargée.</p>
   <table style="border-collapse:collapse;font-size:.95rem">${table}</table>
   <p style="margin-top:20px">
     ${
       linked
-        ? '✅ Le bot est lié. Envoyez-lui « bonjour » pour tester.'
+        ? '✅ Le bot est lié. Envoyez-lui un lien vidéo (ou « s mot-clé » pour chercher).'
         : 'Pour lier votre téléphone : <a href="/pair" style="color:#00a884;font-weight:600">ouvrir la page de code d’appairage</a>.'
     }
   </p>
   <p style="color:#8696a0;font-size:.85rem;margin-bottom:0">
-    Utilitaire : <a href="/backup" style="color:#8696a0">/backup</a> (sauvegarde de la session) ·
-    <a href="/restore" style="color:#8696a0">POST /restore</a> (restauration)
+    Utilitaires : <a href="/backup" style="color:#8696a0">/backup</a> (sauvegarde de la session) ·
+    <a href="/restore" style="color:#8696a0">POST /restore</a> (restauration) ·
+    <a href="/reset" style="color:#8696a0">/reset</a> (effacer la session → re-pairing)
   </p>
 </div></body></html>`)
 })
@@ -121,7 +127,50 @@ app.get('/pair', guard, async (req, res) => {
     console.log('🔑 Nouveau code d’appairage généré via /pair')
     res.send(pairPage(code))
   } catch (err) {
-    res.status(500).send(`Erreur lors de la génération du code : ${err.message}`)
+    console.error('❌ /pair :', err.message)
+    res
+      .status(503)
+      .send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Appairage — en reconnexion</title></head>
+<body style="font-family:system-ui;background:#0b141a;color:#e9edef;display:flex;
+justify-content:center;padding:40px 16px">
+<div style="background:#111b21;border-radius:16px;padding:32px;max-width:480px;width:100%">
+  <h1 style="margin-top:0">🔌 Le bot se reconnecte…</h1>
+  <p>Le service vient peut-être de se réveiller (sommeil Render) — la connexion
+  WhatsApp se relance automatiquement.</p>
+  <p><strong>Détail :</strong> ${String(err.message).replace(/</g, '&lt;')}</p>
+  <p>Cette page se recharge toute seule dans ~30 s.
+  <button onclick="location.reload()" style="background:#00a884;border:0;color:#fff;
+  font-weight:600;padding:10px 18px;border-radius:10px;cursor:pointer">Recharger maintenant</button>
+  </p>
+</div></body></html>`)
+  }
+})
+
+// ---------------------------------------------------------------------
+// /reset : efface la session sauvegardée et relance le socket.
+// À utiliser quand la session est morte (appareil déconnecté, disque effacé,
+// « lié » affiché mais plus d'appareil sur le téléphone).
+// ---------------------------------------------------------------------
+app.get('/reset', guard, async (req, res) => {
+  try {
+    await resetAuth()
+    console.log('🧹 Session réinitialisée via /reset')
+    res.send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="15">
+<title>Session réinitialisée</title></head>
+<body style="font-family:system-ui;background:#0b141a;color:#e9edef;display:flex;
+justify-content:center;padding:40px 16px">
+<div style="background:#111b21;border-radius:16px;padding:32px;max-width:480px;width:100%">
+  <h1 style="margin-top:0">🧹 Session réinitialisée</h1>
+  <p>La session précédente a été effacée et le bot se reconnecte.</p>
+  <p>Rechargez <a href="/pair" style="color:#00a884;font-weight:600">/pair</a> dans quelques
+  secondes (cette page se recharge toute seule) pour obtenir un nouveau code.</p>
+</div></body></html>`)
+  } catch (err) {
+    res.status(500).send(`Erreur /reset : ${err.message}`)
   }
 })
 

@@ -65,13 +65,30 @@ whatsapp-bot/
    appareil → « Lier avec un numéro de téléphone »** → code → Terminé.
 4. `https://mon-bot.onrender.com/` affiche **✅ Lié au compte WhatsApp**.
 
-## 3. Conserver la session entre les déploiements
+## 3. Conserver la session entre les redémarrages (IMPORTANT)
 
-Le disque Render est éphémère (effacé à chaque déploiement) :
+**Le disque du free plan Render est éphémère** : il est effacé à chaque
+déploiement **et à chaque recyclage d'instance** (Render recycle les
+instances gratuites périodiquement, même sans déploiement). Conséquence :
+l'appairage peut « disparaître » — la page passera de « ✅ Lié » à
+« 🔴 Non lié » et l'appareil se déconnectera du téléphone. C'est normal,
+ce n'est pas un bug du bot.
 
-- **Option A (~1 $/mois)** : Disks → disque sur **`/auth`** + `AUTH_DIR=/auth`.
-- **Option B (gratuite)** : `GET /backup?key=CLE` → gardez le JSON ; après un
-  wipe : `POST /restore?key=CLE` avec ce JSON.
+- **Option A (recommandée, ~1 $/mois) — fin des re-appairages** :
+  Render → votre service → **Disks** → *Attach New Disk* → chemin
+  **`/auth`** (1 Go suffit) → puis dans **Environment** ajouter
+  `AUTH_DIR=/auth` → redeploy. La session survit alors à tous les
+  redémarrages et déploiements.
+- **Option B (gratuite)** : après l'appairage, `GET /backup?key=CLE` →
+  gardez précieusement le JSON ; quand la session disparaît,
+  `POST /restore?key=CLE` avec ce JSON (`curl -X POST … -d @backup.json`).
+- **`/reset`** : si la session est morte/corrompue (ex. la page disait « lié »
+  mais aucun appareil sur le téléphone), ouvrez `/reset?key=CLE` : la session
+  est effacée, le bot se reconnecte, puis refaites `/pair` avec un nouveau code.
+
+Le **watchdog** intégré (toutes les 10 s) reconstruit automatiquement la
+connexion WebSocket après un sommeil/coupure ; `GET /` affiche l'état en
+temps réel (connexion + liaison) et se recharge toute seule.
 
 ## 4. Personnaliser le bot
 
@@ -162,4 +179,6 @@ panne), donner vos **cookies YouTube** au yt-dlp local :
 | Échec TikTok / Instagram | IP du serveur bloquée par le réseau (voir §8) |
 | Le bot ne répond pas | endormi (free plan), ou `ALLOWED_FROM` filtre l'expéditeur |
 | Code d'appairage non lié | code expiré (~1 min) → recharger `/pair` ; vérifier `MY_PHONE_NUMBER` |
+| La page affichait « lié » mais aucun appareil sur le téléphone | session effacée par Render (free tier) → `/reset` puis `/pair` ; prévoir le disque §3 |
+| `/pair` : « Le bot se reconnecte… » | le service vient de se réveiller → la page se recharge seule (~30 s) |
 | Fallback lent/absent | service tiers en panne ou endormi → le log montre « API de secours indisponible » |
