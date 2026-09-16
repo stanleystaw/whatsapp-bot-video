@@ -176,13 +176,13 @@ app.get('/qr', guard, async (req, res) => {
   if (isLinked()) {
     return res.send(pairPage('DÉJÀ LIÉ ✅'))
   }
-  // Attendre un QR valide (socket ouvert + QR frais)
+  // Attendre un QR valide (WebSocket réellement ouvert + QR frais)
   const deadline = Date.now() + 25_000
-  while ((!getLatestQr() || !isConnected()) && Date.now() < deadline) {
+  while ((!getLatestQr() || !isWsAlive()) && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1000))
   }
   const qr = getLatestQr()
-  if (!qr || !isConnected()) {
+  if (!qr || !isWsAlive()) {
     return res.status(503).send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="20">
 <title>QR — en attente</title></head>
