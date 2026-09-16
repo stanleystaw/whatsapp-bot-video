@@ -29,6 +29,7 @@ let sock = null
 let state = null
 let stopping = false
 let pairingCode = null
+let latestQr = null // dernier payload QR émis par Baileys (rotation ~20 s)
 let connected = false // socket WebSocket ouvert ?
 let rebuilding = false // watchdog : reconstruction en cours ?
 let buildStartedAt = 0 // horodatage du build en cours (anti-blocage)
@@ -42,6 +43,8 @@ export const isLinked = () => Boolean(state?.creds?.registered)
 export const isConnected = () => connected
 /** Dernier code d'appairage généré (sinon null) */
 export const getPairingCode = () => pairingCode
+/** Dernier payload QR (pour l'afficher scannable) */
+export const getLatestQr = () => latestQr
 export const authDir = () => AUTH_DIR
 
 /** État détaillé pour le diagnostic (endpoint /status). */
@@ -151,27 +154,25 @@ async function buildSocket() {
   // Persiste la session à chaque mise à jour (crucial après l'appairage)
   s.ev.on('creds.update', sc)
 
-  s.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+  s.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     const status = lastDisconnect?.error?.output?.statusCode
+
+    // Baileys émet le QR automatiquement (rotation ~20 s) quand non lié
+    if (qr) latestQr = qr
 
     if (connection === 'open') {
       connected = true
       if (!state.creds.registered) {
+        console.log(' Connecté (non lié) — QR disponible sur /qr, code sur /pair')
         if (!MY_PHONE) {
-          console.error('⚠️ Session non liée et MY_PHONE_NUMBER absent — impossible de demander un code.')
-          return
+          console.warn('⚠️ MY_PHONE_NUMBER absent : le mode « code d’appairage » (/pair) sera indisponible')
         }
-        s.requestPairingCode(MY_PHONE)
-          .then((code) => {
-            pairingCode = code
-            console.log('🔑 Code d’appairage généré (visitez /pair)')
-          })
-          .catch((err) => console.error('❌ Erreur lors de la génération du code :', err.message))
       } else {
         console.log('✅ Connecté et lié au compte WhatsApp')
       }
     } else if (connection === 'close') {
       connected = false
+      latestQr = null // un QR ne sert à rien si le socket est mort
       lastCloseStatus = status ?? 'inconnu'
       if (status === DisconnectReason.loggedOut) {
         console.log('👋 Déconnexion (loggedOut) : réinitialisation de la session')
