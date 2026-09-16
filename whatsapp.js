@@ -39,7 +39,7 @@ let lastCloseStatus = null // dernier status de fermeture (diagnostic)
 const silent = pino({ level: 'silent' })
 
 /** Le bot est-il lié au compte WhatsApp ? */
-export const isLinked = () => Boolean(state?.creds?.registered)
+export const isLinked = () => Boolean(state?.creds?.me || state?.creds?.registered)
 /** Le socket est-il connecté (WebSocket ouvert) ? */
 export const isConnected = () => connected
 /** État RÉEL du WebSocket (ouvert même pendant la phase QR,
