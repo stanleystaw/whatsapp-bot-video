@@ -27,7 +27,7 @@ try { FFPROBE = requireCjs('ffprobe-static').path } catch {}
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
 // Budget disque (instance Render gratuite ≈ 512 Mo au total) + confort WhatsApp mobile
-export const VF_MAX_MB = 250
+export const VF_MAX_MB = 800
 const VF_TIMEOUT_MS = 20 * 60 * 1000 // dur max par téléchargement
 
 function decodeXml(s) {
