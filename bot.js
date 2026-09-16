@@ -3,6 +3,7 @@ import path from 'node:path'
 import { sendMessage, sendVideo, sendDocument } from './whatsapp.js'
 import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT, DL_DIR } from './downloader.js'
 import { anipubSearch, anipubEpisodeId, anipubResolveMedia, anipubBuildPlaylist } from './anipub.js'
+import { vfPick, vfDownload, vfMakeFrench, vfClean, VF_MAX_MB } from './vf.js'
 
 // Recherches en attente : jid -> { results, ts } (expirées après 10 min)
 const pending = new Map()
@@ -27,6 +28,9 @@ function helpText() {
     '',
     '• **Anime (AniPub)** : envoie un lien anipub.xyz (recherche ou épisode)',
     '  Ex : le lien de recherche de ton anime, puis choisis le numéro',
+    '',
+    '• **Anime VRAIE VF** : `vf nom [sXXeYY]` → je télécharge l\'épisode dublé (nyaa)',
+    '  Ex : `vf demon slayer s04e11` ou `vf demon slayer 11`',
     '',
     '• **Anime VF** : `a nom` → je cherche les épisodes sur YouTube',
     '  Ex : `a one piece` puis `3`',
@@ -92,6 +96,14 @@ export async function handleMessage(from, text) {
     const url = urlMatch[0].replace(/[).,;!?]+$/, '')
     if (/anipub\.xyz/i.test(url)) return anipubUrl(from, url)
     return downloadAndSend(from, url)
+  }
+
+  // --- 2b) Anime VF réelle : "vf nom [saison/épisode]" (nyaa + torrent, vraie VF) ---
+  const vfMatch = text.match(/^vf\s+(.+)$/i)
+  if (vfMatch) {
+    const q = vfMatch[1].trim()
+    if (!q) return sendMessage(from, 'Quel anime ? Exemple : `vf demon slayer s04e11` ou `vf demon slayer 11`')
+    return vfFlow(from, q)
   }
 
   // --- 3) Anime VF : "a nom" / "anime nom" (recherche YouTube avec VF) ----
@@ -226,6 +238,64 @@ async function anipubTryDownload(from, finder, epNumber, name = '') {
   } catch (err) {
     await sendMessage(from, `⚠️ Erreur AniPub : ${err.message}`)
   }
+}
+
+// --- Anime VF réelle (nyaa + aria2) ------------------------------------------
+const VF_MIME = { mkv: 'video/x-matroska', mp4: 'video/mp4', avi: 'video/x-msvideo', webm: 'video/webm' }
+
+async function vfFlow(from, q) {
+  try {
+    await sendMessage(from, `🎌 Recherche d'une vraie VF pour « ${q} » sur nyaa…`)
+  } catch {}
+  let best, all
+  try {
+    ;({ best, all } = await vfPick(q))
+  } catch (e) {
+    return sendMessage(from, `⚠️ Recherche impossible : ${e.message}`)
+  }
+  if (!best) {
+    const fr = (all || []).filter((i) => /VF|VOSTFR|FRENCH/i.test(i.title)).slice(0, 3)
+    const extra = fr.length
+      ? `\n\nTrouvé mais indisponible (trop volumineux ou 0 seeders) :\n${fr.map((f) => `• ${f.title}`).join('\n')}`
+      : `\n\nCe titre n'a pas de VF sur nyaa (Naruto, One Piece… sont dublés par TF1/ADN, pas Crunchyroll).\nAlternatives : \`a ${q}\` (YouTube) ou le site Crunchyroll.`
+    return sendMessage(from, `❌ Pas d'épisode VF téléchargeable pour « ${q} » (limite ${VF_MAX_MB} Mo / seeders requis).${extra}`)
+  }
+  const mo = Math.round(best.size / 1048576)
+  try {
+    await sendMessage(
+      from,
+      `✅ ${best.title}\n📦 ${mo} Mo • 🔻 seeders : ${best.seeds}${best.leech ? ` (leechers : ${best.leech})` : ''}\n⏳ Téléchargement… (1-5 min, patience)`
+    )
+  } catch {}
+  let file = null
+  try {
+    file = await vfDownload(best.link)
+  } catch (e) {
+    vfClean([file])
+    return sendMessage(from, `⚠️ Téléchargement échoué : ${e.message}\nRetente dans quelques minutes (peu de seeders sur les épisodes très récents).`)
+  }
+  let finalFile = file
+  let note = ''
+  try {
+    const r = vfMakeFrench(file)
+    finalFile = r.file
+    note = r.note
+  } catch (e) {
+    note = '⚠️ vérification audio impossible'
+  }
+  const sz = fs.statSync(finalFile).size
+  if (sz > 480 * 1024 * 1024) {
+    vfClean([file, finalFile === file ? null : file])
+    return sendMessage(from, `⚠️ Le fichier fait ${Math.round(sz / 1048576)} Mo, trop gros pour WhatsApp.`)
+  }
+  const ext = path.extname(finalFile).slice(1).toLowerCase() || 'mkv'
+  try {
+    await sendDocument(from, finalFile, VF_MIME[ext] || 'video/x-matroska', `${best.title}\n\n📎 Fichier vidéo VF (${Math.round(sz / 1048576)} Mo)${note ? ' — ' + note : ''}\nAppuie dessus pour le télécharger et le lire.`)
+  } catch (e) {
+    vfClean([file, finalFile === file ? null : file])
+    return sendMessage(from, `⚠️ Envoi impossible : ${e.message}`)
+  }
+  vfClean([file, finalFile === file ? null : file])
 }
 
 const MIME_BY_EXT = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/x-m4v' }
