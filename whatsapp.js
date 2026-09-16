@@ -35,6 +35,7 @@ let connected = false // socket WebSocket ouvert ?
 let rebuilding = false // watchdog : reconstruction en cours ?
 let buildStartedAt = 0 // horodatage du build en cours (anti-blocage)
 let lastCloseStatus = null // dernier status de fermeture (diagnostic)
+const seenMsgs = new Map() // key.id -> ts (anti-doublon messages.upsert)
 
 const silent = pino({ level: 'silent' })
 
@@ -110,10 +111,9 @@ export async function sendVideo(to, filePath, caption = '') {
   const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
   const ext = path.extname(filePath).slice(1).toLowerCase()
   await sock.sendMessage(jid, {
-    url: filePath, // Baileys lit le fichier local
+    video: fs.readFileSync(filePath), // buffer local — Baileys exige une clé MEDIA_KEYS
     caption,
     mimetype: MIMES[ext] || 'video/mp4',
-    fileName: path.basename(filePath),
   })
 }
 
@@ -205,10 +205,24 @@ async function buildSocket() {
     for (const m of messages) {
       try {
         if (!m || !m.key || m.key.fromMe) continue
+        // Anti-doublon : Baileys peut ré-émettre le même message (même key.id)
+        const mid = m.key.id
+        if (mid) {
+          const seen = seenMsgs.get(mid)
+          if (seen && Date.now() - seen < 120_000) continue
+          seenMsgs.set(mid, Date.now())
+          if (seenMsgs.size > 500) {
+            for (const [k, t] of seenMsgs) if (Date.now() - t > 120_000) seenMsgs.delete(k)
+          }
+        }
         const jid = m.key.remoteJid
         if (!jid || jid === 'status@broadcast') continue
 
-        const text = m.message?.conversation || m.message?.extendedTextMessage?.text
+        // Déballage des messages éphémères / one-time (contenu imbriqué)
+        let msg = m.message
+        if (msg?.ephemeralMessage?.message) msg = msg.ephemeralMessage.message
+        if (msg?.viewOnceMessage?.message) msg = msg.viewOnceMessage.message
+        const text = msg?.conversation || msg?.extendedTextMessage?.text
         if (!text) {
           try {
             await sendMessage(jid, "🤖 Pour l'instant je ne peux traiter que les messages texte.")
