@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import pino from 'pino'
 import makeWASocket, {
   useMultiFileAuthState,
@@ -70,6 +71,22 @@ export function getDiagnostics() {
     hasQr: Boolean(latestQr),
     qrSeen,
     hasMe: Boolean(state?.creds?.me),
+    hasFfmpeg: (() => {
+      try {
+        const p = createRequire(import.meta.url)('ffmpeg-static')
+        return typeof p === 'string' && fs.existsSync(p)
+      } catch {
+        return false
+      }
+    })(),
+    diskFreeMB: (() => {
+      try {
+        const s = fs.statfsSync(AUTH_DIR)
+        return Math.round((s.bavail * s.bsize) / 1048576)
+      } catch {
+        return null
+      }
+    })(),
     pairingCodeReady: Boolean(pairingCode),
     myPhoneSet: MY_PHONE.length > 0,
     myPhone: MY_PHONE ? MY_PHONE.replace(/^(\d{3})\d+(\d{3})$/, '$1 *** $2') : null,
@@ -111,9 +128,24 @@ export async function sendVideo(to, filePath, caption = '') {
   const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
   const ext = path.extname(filePath).slice(1).toLowerCase()
   await sock.sendMessage(jid, {
-    video: fs.readFileSync(filePath), // buffer local — Baileys exige une clé MEDIA_KEYS
+    video: { url: filePath }, // chemin local — Baileys stream depuis le disque
     caption,
     mimetype: MIMES[ext] || 'video/mp4',
+  })
+}
+
+/**
+ * Envoie un fichier (vidéo volumineuse) en DOCUMENT — WhatsApp accepte
+ * jusqu'à ~2 Go. Le destinataire reçoit un fichier téléchargeable/lectible.
+ */
+export async function sendDocument(to, filePath, mimetype = 'video/mp4', caption = '') {
+  if (!sock || !isLinked()) throw new Error('Bot non lié — passez par /pair')
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
+  await sock.sendMessage(jid, {
+    document: { url: filePath }, // chemin local — stream disque (mémoire minime)
+    mimetype,
+    fileName: path.basename(filePath),
+    caption,
   })
 }
 

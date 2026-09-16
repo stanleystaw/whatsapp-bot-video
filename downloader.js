@@ -9,22 +9,25 @@ const BIN = path.join(__dirname, 'bin', 'yt-dlp')
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp'
 // Dossier de travail temporaire (effacé à chaque redémarrage du service)
 const DL_DIR = fs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'wabo-'))
-// Limite réaliste pour un média vidéo WhatsApp (~16 Mo)
-const MAX_SIZE = 15 * 1024 * 1024
+// ≤ 15 Mo : envoyé comme VIDÉO (lecture directe) ;
+// > 15 Mo : envoyé comme FICHIER (document) — épisode complet d'anime OK.
+export const VIDEO_LIMIT = 15 * 1024 * 1024
+// Plafond total en mode fichier (disque free Render = 512 Mo)
+const DOC_LIMIT = (Number(process.env.DOC_LIMIT_MB) || 180) * 1024 * 1024
 // API de secours (testée ✅ YouTube vidéo/audio, Facebook) — servie par un tiers.
 // Mettre vide pour la désactiver.
 const FALLBACK_API = (process.env.DOWNLOAD_API || 'https://apischristus.vercel.app/api/auto').trim()
 
-// Échelle de formats : on commence par du 480p mp4 (léger, lisible partout),
-// puis on descend si le fichier dépasse la limite.
-const FORMATS = [
-  'b[ext=mp4][height<=480]',
-  'b[ext=mp4][height<=360]',
-  'b[height<=480]',
-  'b',
-]
-
 let ensured = false
+
+// ffmpeg statique (fusion des streams DASH — YouTube moderne) — optionnel.
+let FFMPEG_PATH = null
+try {
+  const { createRequire } = await import('node:module')
+  const req = createRequire(import.meta.url)
+  const p = req('ffmpeg-static')
+  if (typeof p === 'string' && fs.existsSync(p)) FFMPEG_PATH = p
+} catch {}
 
 // ---------------------------------------------------------------------
 // Cookies YouTube (optionnel) — contournement de la vérification anti-bot
@@ -53,25 +56,56 @@ function writeCookieFile() {
   }
 }
 
-/** Arguments cookies pour les URLs YouTube uniquement. */
-function ytCookiesArgs(url) {
-  if (!/youtube\.com|youtu\.be/i.test(url)) return []
-  const f = writeCookieFile()
-  return f ? ['--cookies', f] : []
+/** Arguments d'authentification : cookies YouTube + compte Crunchyroll.
+ *  Crunchyroll (anime VF) : CRUNCHYROLL_EMAIL + CRUNCHYROLL_PASSWORD,
+ *  OU CRUNCHYROLL_COOKIES (fichier Netscape en clair/base64 — plus sûr). */
+function credArgs(url) {
+  const args = []
+  if (/youtube\.com|youtu\.be/i.test(url)) {
+    const f = writeCookieFile()
+    if (f) args.push('--cookies', f)
+  }
+  if (/crunchyroll/i.test(url)) {
+    const raw = (process.env.CRUNCHYROLL_COOKIES || '').trim()
+    if (raw) {
+      let content = raw
+      const compact = raw.replace(/\s+/g, '')
+      if (/^[A-Za-z0-9+/=]+$/.test(compact) && compact.length > 100) {
+        try {
+          const dec = Buffer.from(compact, 'base64').toString('utf8')
+          if (dec.includes('crunchyroll') || dec.startsWith('#')) content = dec
+        } catch {}
+      }
+      try {
+        const f = path.join(DL_DIR, 'cr-cookies.txt')
+        fs.writeFileSync(f, content)
+        args.push('--cookies', f)
+      } catch (err) {
+        console.warn('⚠️ Cookies Crunchyroll :', err.message)
+      }
+    } else {
+      const u = (process.env.CRUNCHYROLL_EMAIL || '').trim()
+      const p = process.env.CRUNCHYROLL_PASSWORD || ''
+      if (u && p) args.push('--username', u, '--password', p)
+    }
+  }
+  return args
 }
 
-/** Installe yt-dlp si le binaire n'est pas présent (au build OU au runtime). */
+/** Installe yt-dlp si le binaire n'est pas présent (au build OU au runtime),
+ *  et garantit toujours le bit d'exécution (le FS peut le perdre). */
 export async function ensureYtDlp() {
-  if (ensured && fs.existsSync(BIN)) return
   if (!fs.existsSync(BIN)) {
     console.log('⬇️ Téléchargement de yt-dlp (runtime)…')
     const res = await fetch(YTDLP_URL, { redirect: 'follow' })
     if (!res.ok) throw new Error(`Impossible de télécharger yt-dlp (HTTP ${res.status})`)
     fs.mkdirSync(path.dirname(BIN), { recursive: true })
     fs.writeFileSync(BIN, Buffer.from(await res.arrayBuffer()))
-    fs.chmodSync(BIN, 0o755)
     console.log('✅ yt-dlp installé')
   }
+  try {
+    fs.chmodSync(BIN, 0o755)
+  } catch {}
   ensured = true
 }
 
@@ -180,7 +214,7 @@ async function tryFallbackApi(url) {
       j.medias?.[0]?.url
     if (!video) return null
     const dest = path.join(DL_DIR, `api_${Date.now()}.mp4`)
-    const r = await fetchToFile(video, dest, MAX_SIZE)
+    const r = await fetchToFile(video, dest, DOC_LIMIT)
     if (r.tooBig) {
       fs.rmSync(dest, { force: true })
       return { tooBig: true, url }
@@ -201,52 +235,116 @@ async function tryFallbackApi(url) {
 export async function downloadVideo(url) {
   await ensureYtDlp()
   let lastError = null
-  let sawTooBig = false
 
-  for (const fmt of FORMATS) {
-    try {
-      const { out } = await run([
-        ...ytCookiesArgs(url),
-        '-f', fmt,
-        '--no-playlist',
-        '--no-warnings',
-        '--retries', '3',
-        '--socket-timeout', '20',
-        '-o', path.join(DL_DIR, '%(id)s.%(ext)s'),
-        '--print', 'after_move:filepath',
-        '--print', 'after_move:title',
-        url,
-      ])
-      const lines = out.trim().split('\n')
-      const filePath = lines[0].trim()
-      const title = lines.slice(1).join('\n').trim()
+  // --- 1) Métadonnées (rapide) : erreur définitive immédiate + choix de format
+  let meta = null
+  try {
+    const { out } = await run([...credArgs(url), '-J', '--no-playlist', '--no-warnings', url], 90_000)
+    meta = JSON.parse(out.trim())
+  } catch (err) {
+    lastError = err
+    console.log('ℹ️ Métadonnées en échec → tentative API…', err.message)
+  }
 
-      if (!filePath || !fs.existsSync(filePath)) {
-        throw new Error('Fichier introuvable après téléchargement')
+  if (meta) {
+    // Formats fusionnés vidéo+audio ; mp4 en priorité (lisible partout)
+    const merged = (meta.formats || []).filter((f) => f.vcodec !== 'none' && f.acodec !== 'none')
+    const mp4 = merged.filter((f) => f.ext === 'mp4')
+    const pool = mp4.length ? mp4 : merged
+    pool.sort(
+      (a, b) =>
+        (a.height || 0) - (b.height || 0) ||
+        (a.filesize_approx || a.filesize || 0) - (b.filesize_approx || b.filesize || 0)
+    )
+    const sized = pool.filter((f) => (f.filesize_approx || f.filesize || 0) > 0)
+    let pick = sized.find((f) => (f.filesize_approx || f.filesize || 0) <= DOC_LIMIT) || sized[0] || pool[0]
+
+    // Source DASH uniquement (YouTube moderne : streams séparés vidéo+audio)
+    // → on fusionne avec ffmpeg si dispo
+    if (!pick && FFMPEG_PATH) {
+      const vids = (meta.formats || [])
+        .filter((f) => f.vcodec !== 'none' && f.ext === 'mp4' && (f.height || 0) <= 480)
+        .sort((a, b) => (b.height || 0) - (a.height || 0))
+      const auds = (meta.formats || [])
+        .filter((f) => f.vcodec === 'none' && f.acodec !== 'none')
+        .sort((a, b) => (a.filesize_approx || a.filesize || 0) - (b.filesize_approx || b.filesize || 0))
+      if (vids.length && auds.length) {
+        const a = auds[0] // audio le plus léger (généralement 128 kbps)
+        const aSize = a.filesize_approx || a.filesize || 0
+        const v =
+          vids.find((f) => (f.filesize_approx || f.filesize || 0) + aSize <= DOC_LIMIT) ||
+          vids[vids.length - 1]
+        pick = {
+          ...v,
+          format_id: `${v.format_id}+${a.format_id}`,
+          filesize_approx: (v.filesize_approx || v.filesize || 0) + aSize,
+        }
       }
-      const size = fs.statSync(filePath).size
-      if (size > MAX_SIZE) {
-        fs.rmSync(filePath, { force: true })
-        sawTooBig = true
-        lastError = new Error('Vidéo trop volumineuse pour WhatsApp (max ~15 Mo)')
-        continue // on tente un format plus petit
+    }
+
+    if (pick) {
+      const approx = pick.filesize_approx || pick.filesize || 0
+      if (approx > DOC_LIMIT) {
+        console.log(`↩️ Vidéo ~${Math.round(approx / 1048576)} Mo > limite ${Math.round(DOC_LIMIT / 1048576)} Mo`)
+        return { tooBig: true, url }
       }
-      return { path: filePath, title, size }
-    } catch (err) {
-      const msg = String(err?.message || '')
-      lastError = err
-      // Erreur "réelle" (lien invalide, vidéo privée/indisponible, site non
-      // supporté, blocage anti-bot…) → on stoppe l'échelle de formats
-      if (/unsupported url|private video|is not a valid URL|Inappropriate|not exist|unavailable|removed|deleted|private|unable to extract|is an unsupported|timeout|Sign in to confirm|login (is )?(required|needed)|blocked by/i.test(msg)) {
-        break
+
+      // --- 2) Espace disque (plan free Render : 512 Mo au total)
+      if (typeof fs.statfsSync === 'function') {
+        try {
+          const s = fs.statfsSync(DL_DIR)
+          const free = s.bavail * s.bsize
+          const need = (approx || 50 * 1024 * 1024) * 1.4
+          if (free < need) {
+            throw new Error(
+              `Pas assez de place libre sur le serveur (${Math.round(free / 1048576)} Mo libres, ~${Math.round(need / 1048576)} Mo requis) — essaie une vidéo plus courte.`
+            )
+          }
+        } catch (err) {
+          if (String(err.message).startsWith('Pas assez')) throw err
+          // statfs indisponible → on tente quand même
+        }
+      }
+
+      // --- 3) Téléchargement du format choisi (timeout adapté à la taille)
+      try {
+        const timeoutMs = 240_000 + Math.round((approx || 50 * 1024 * 1024) / 1024)
+        const { out } = await run(
+          [
+            ...credArgs(url),
+            ...(FFMPEG_PATH ? ['--ffmpeg-location', FFMPEG_PATH] : []),
+            '-f', String(pick.format_id),
+            '--no-playlist',
+            '--no-warnings',
+            '--retries', '3',
+            '--socket-timeout', '20',
+            '-o', path.join(DL_DIR, '%(id)s.%(ext)s'),
+            '--print', 'after_move:filepath',
+            '--print', 'after_move:title',
+            url,
+          ],
+          timeoutMs
+        )
+        const lines = out.trim().split('\n')
+        const filePath = lines[0].trim()
+        const title = lines.slice(1).join('\n').trim()
+        if (!filePath || !fs.existsSync(filePath)) throw new Error('Fichier introuvable après téléchargement')
+        const size = fs.statSync(filePath).size
+        if (size > DOC_LIMIT) {
+          fs.rmSync(filePath, { force: true })
+          return { tooBig: true, url }
+        }
+        console.log(`✅ Téléchargé : ${title || pick.format_id} (${Math.round(size / 1048576)} Mo)`)
+        return { path: filePath, title, size }
+      } catch (err) {
+        lastError = err
+        console.log('ℹ️ Téléchargement du format choisi en échec → tentative API…', err.message)
       }
     }
   }
 
-  if (sawTooBig) return { tooBig: true, url }
-
-  // Échelle locale épuisée (anti-bot, site bloqué…) → API de secours
-  console.log('↪️  yt-dlp local en échec, tentative via l’API de secours…')
+  // --- 4) API de secours (FB, TikTok, liens que yt-dlp ne passe pas)
+  console.log('↪️ yt-dlp local en échec, tentative via l’API de secours…')
   const fb = await tryFallbackApi(url)
   if (fb) return fb
 
