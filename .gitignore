@@ -3,3 +3,6 @@ node_modules/
 bin/
 auth/
 *.log
+auth-backup/
+auth-backup.tmp/
+auth.swp/

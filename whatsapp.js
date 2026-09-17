@@ -16,6 +16,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // Dossier où la session (auth) est persistée. Sur Render, pointez-le
 // vers un disque attaché (ex. /auth) pour ne pas tout relier à chaque déploiement.
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth')
+// Sauvegarde "live" de la session saine (auto-restaure après coupure),
+// sur le même disque mais en dehors du dossier de session.
+const BACKUP_DIR = process.env.AUTH_BACKUP_DIR || path.join(path.dirname(AUTH_DIR), 'auth-backup')
 // Ton numéro (format international, chiffres uniquement)
 const MY_PHONE = (process.env.MY_PHONE_NUMBER || '').replace(/[^0-9]/g, '')
 // Optionnel : liste blanche de numéros autorisés à dialoguer avec le bot
@@ -37,6 +40,64 @@ let rebuilding = false // watchdog : reconstruction en cours ?
 let buildStartedAt = 0 // horodatage du build en cours (anti-blocage)
 let lastCloseStatus = null // dernier status de fermeture (diagnostic)
 const seenMsgs = new Map() // key.id -> ts (anti-doublon messages.upsert)
+
+// 🩺 Auto-restaure : si la connexion revient en mode QR (session morte côté
+// WhatsApp, timeout 408…) alors qu'une sauvegarde saine existe, on la
+// restaure tout seul — sans intervention de l'utilisateur.
+let qrSinceTs = 0 // depuis quand le socket est ouvert MAIS non lié (mode QR)
+let lastAutoRestore = 0
+let lastSnapshot = 0
+let resetGuard = false // /reset demandé → pas d'auto-restaure tant que non relié
+
+const hasBackup = () => {
+  try { return fs.existsSync(path.join(BACKUP_DIR, 'creds.json')) } catch { return false }
+}
+
+// Copie la session courante (saine : lié + connecté) vers BACKUP_DIR.
+function snapshotAuth() {
+  if (!isLinked() || !connected) return
+  if (Date.now() - lastSnapshot < 10 * 60 * 1000) return
+  try {
+    const tmp = BACKUP_DIR + '.tmp'
+    fs.rmSync(tmp, { recursive: true, force: true })
+    fs.cpSync(AUTH_DIR, tmp, { recursive: true })
+    fs.rmSync(BACKUP_DIR, { recursive: true, force: true })
+    fs.renameSync(tmp, BACKUP_DIR)
+    lastSnapshot = Date.now()
+    console.log('💾 Sauvegarde live de la session →', BACKUP_DIR)
+  } catch (e) {
+    console.warn('⚠️ Sauvegarde live impossible :', e.message)
+  }
+}
+
+// Restaure BACKUP_DIR sur AUTH_DIR et relance le socket.
+async function autoRestore() {
+  if (Date.now() - lastAutoRestore < 5 * 60 * 1000) return false
+  if (resetGuard || !hasBackup()) return false
+  lastAutoRestore = Date.now()
+  console.log('🩺 Auto-restaure : récupération de la session sauvegardée…')
+  try {
+    stopping = true
+    try { sock?.end() } catch {}
+    sock = null
+    const tmp = AUTH_DIR + '.swp'
+    fs.rmSync(tmp, { recursive: true, force: true })
+    fs.cpSync(BACKUP_DIR, tmp, { recursive: true })
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+    fs.renameSync(tmp, AUTH_DIR)
+    state = null
+    pairingCode = null
+    connected = false
+    qrSinceTs = 0
+    stopping = false
+    await restart()
+    console.log('✅ Auto-restaure terminée — reconnexion en cours')
+    return true
+  } catch (e) {
+    console.error('❌ Auto-restaure échouée :', e.message)
+    return false
+  }
+}
 
 const silent = pino({ level: 'silent' })
 
@@ -95,6 +156,12 @@ export function getDiagnostics() {
     authDir: AUTH_DIR,
     hasAuth: fs.existsSync(AUTH_DIR),
     uptimeSec: Math.round(process.uptime()),
+    autoRestore: {
+      backupExists: hasBackup(),
+      lastSnapshot: lastSnapshot || null,
+      lastAutoRestore: lastAutoRestore || null,
+      qrModeSinceSec: qrSinceTs ? Math.round((Date.now() - qrSinceTs) / 1000) : null,
+    },
   }
 }
 
@@ -311,6 +378,9 @@ export async function resetAuth() {
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true })
   } catch {}
+  // Garde-fou : pas d'auto-restaure tant qu'un nouvel appairage n'a pas abouti
+  resetGuard = true
+  qrSinceTs = 0
   state = null
   pairingCode = null
   connected = false
@@ -327,6 +397,27 @@ setInterval(() => {
   const ws = sock?.ws
   // Baileys v7 : wrapper avec isOpen / isConnecting / isClosed / isClosing
   const active = Boolean(ws && (ws.isOpen || ws.isConnecting))
+
+  // 💾 Sauvegarde live de la session saine (pour l'auto-restaure)
+  if (sock && active && isLinked()) {
+    resetGuard = false // appairage abouti → on lève le garde-fou
+    qrSinceTs = 0
+    snapshotAuth()
+    return
+  }
+
+  // 🩺 Socket ouvert mais NON lié (mode QR) depuis >90 s → la session du
+  // disque est morte côté WhatsApp. On restaure la sauvegarde saine.
+  if (sock && active && !isLinked()) {
+    if (!qrSinceTs) qrSinceTs = Date.now()
+    if (Date.now() - qrSinceTs > 90_000 && hasBackup()) {
+      qrSinceTs = 0
+      console.log('🩺 Watchdog : session morte (mode QR) — auto-restaure…')
+      autoRestore().catch((e) => console.error('❌ Auto-restaure :', e.message))
+    }
+    return
+  }
+
   if (sock && active) return // en cours ou ouvert → on n'y touche pas
   if (rebuilding) {
     // Build précédent bloqué depuis plus de 90 s (fetch version, réseau…)
