@@ -10,6 +10,7 @@ import makeWASocket, {
   DisconnectReason,
   makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys'
+import { pushRemoteBackup, fetchRemoteBackup, writeAuthFiles } from './session-backup.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -47,16 +48,19 @@ const seenMsgs = new Map() // key.id -> ts (anti-doublon messages.upsert)
 let qrSinceTs = 0 // depuis quand le socket est ouvert MAIS non lié (mode QR)
 let lastAutoRestore = 0
 let lastSnapshot = 0
+let lastRemotePush = 0
 let resetGuard = false // /reset demandé → pas d'auto-restaure tant que non relié
 
 const hasBackup = () => {
   try { return fs.existsSync(path.join(BACKUP_DIR, 'creds.json')) } catch { return false }
 }
 
-// Copie la session courante (saine : lié + connecté) vers BACKUP_DIR.
+// Copie la session courante (saine : lié + connecté) vers BACKUP_DIR,
+// puis la pousse vers le Worker Cloudflare (survit à l'effacement du disque).
 function snapshotAuth() {
   if (!isLinked() || !connected) return
   if (Date.now() - lastSnapshot < 10 * 60 * 1000) return
+  let localOk = false
   try {
     const tmp = BACKUP_DIR + '.tmp'
     fs.rmSync(tmp, { recursive: true, force: true })
@@ -64,10 +68,17 @@ function snapshotAuth() {
     fs.rmSync(BACKUP_DIR, { recursive: true, force: true })
     fs.renameSync(tmp, BACKUP_DIR)
     lastSnapshot = Date.now()
+    localOk = true
     console.log('💾 Sauvegarde live de la session →', BACKUP_DIR)
   } catch (e) {
-    console.warn('⚠️ Sauvegarde live impossible :', e.message)
+    console.warn('⚠️ Sauvegarde live locale impossible :', e.message)
   }
+  // Pousse vers le Worker (Cloudflare) pour que la session survive à un
+  // effacement complet du disque Render.
+  pushRemoteBackup(AUTH_DIR).then((r) => {
+    if (r.ok) { lastRemotePush = Date.now(); console.log('☁️ Session poussée vers le Worker CF (' + r.size + ' o)') }
+    else console.warn('⚠️ Push Worker CF impossible :', r.why)
+  }).catch((e) => console.warn('⚠️ Push Worker CF :', e.message))
 }
 
 // Restaure BACKUP_DIR sur AUTH_DIR et relance le socket.
@@ -95,6 +106,42 @@ async function autoRestore() {
     return true
   } catch (e) {
     console.error('❌ Auto-restaure échouée :', e.message)
+    return false
+  }
+}
+
+// Restaure la session depuis le Worker Cloudflare (quand le disque local a
+// été entièrement effacé — recréation d'instance Render).
+async function remoteRestore() {
+  if (Date.now() - lastAutoRestore < 5 * 60 * 1000) return false
+  if (resetGuard) return false
+  lastAutoRestore = Date.now()
+  console.log('🩺 Remote-restaure : récupération de la session depuis le Worker CF…')
+  const backup = await fetchRemoteBackup()
+  if (!backup) {
+    console.warn('⚠️ Aucune sauvegarde disponible sur le Worker CF')
+    return false
+  }
+  try {
+    stopping = true
+    try { sock?.end() } catch {}
+    sock = null
+    const tmp = AUTH_DIR + '.swp'
+    fs.rmSync(tmp, { recursive: true, force: true })
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+    fs.mkdirSync(tmp, { recursive: true })
+    writeAuthFiles(tmp, backup.files)
+    fs.renameSync(tmp, AUTH_DIR)
+    state = null
+    pairingCode = null
+    connected = false
+    qrSinceTs = 0
+    stopping = false
+    await restart()
+    console.log('✅ Remote-restaure terminée (sauvegarde du ' + (backup.generatedAt || '?') + ')')
+    return true
+  } catch (e) {
+    console.error('❌ Remote-restaure échouée :', e.message)
     return false
   }
 }
@@ -159,6 +206,7 @@ export function getDiagnostics() {
     autoRestore: {
       backupExists: hasBackup(),
       lastSnapshot: lastSnapshot || null,
+      lastRemotePush: lastRemotePush || null,
       lastAutoRestore: lastAutoRestore || null,
       qrModeSinceSec: qrSinceTs ? Math.round((Date.now() - qrSinceTs) / 1000) : null,
     },
@@ -410,10 +458,15 @@ setInterval(() => {
   // disque est morte côté WhatsApp. On restaure la sauvegarde saine.
   if (sock && active && !isLinked()) {
     if (!qrSinceTs) qrSinceTs = Date.now()
-    if (Date.now() - qrSinceTs > 90_000 && hasBackup()) {
+    if (Date.now() - qrSinceTs > 90_000) {
       qrSinceTs = 0
-      console.log('🩺 Watchdog : session morte (mode QR) — auto-restaure…')
-      autoRestore().catch((e) => console.error('❌ Auto-restaure :', e.message))
+      if (hasBackup()) {
+        console.log('🩺 Watchdog : session morte (mode QR) — auto-restaure locale…')
+        autoRestore().catch((e) => console.error('❌ Auto-restaure :', e.message))
+      } else {
+        console.log('🩺 Watchdog : session morte (mode QR, disque effacé) — restaure distante…')
+        remoteRestore().catch((e) => console.error('❌ Remote-restaure :', e.message))
+      }
     }
     return
   }
