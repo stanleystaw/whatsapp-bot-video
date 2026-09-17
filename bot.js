@@ -5,6 +5,7 @@ import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT, DL_DIR } from '.
 import { anipubSearch, anipubEpisodeId, anipubResolveMedia, anipubBuildPlaylist } from './anipub.js'
 import { vfPick, vfDownload, vfMakeFrench, vfClean, VF_MAX_MB } from './vf.js'
 import { mangaSearch, mangaRank } from './manga.js'
+import { tiktokSearch, downloadTo } from './tiktok.js'
 
 // Recherches en attente : jid -> { results, ts } (expirées après 10 min)
 const pending = new Map()
@@ -35,6 +36,9 @@ function helpText() {
     '',
     '• **Mangas** : `m nom` → je liste les mangas dispo (VF/EN), tu choisis le n°',
     '  Ex : `m one piece` puis `1` (taille, seeders et langue affichés)',
+    '',
+    '• **TikTok** : `tt mot-clé` → je liste 8 vidéos, tu choisis le n°',
+    '  Ex : `tt naruto edit` puis `1` (sans watermark)',
     '',
     '• **Anime VF** : `a nom` → je cherche les épisodes sur YouTube',
     '  Ex : `a one piece` puis `3`',
@@ -92,6 +96,11 @@ export async function handleMessage(from, text) {
       if (!r) return sendMessage(from, `Choisis un numéro entre 1 et ${p.results.length}.`)
       pending.delete(from)
       return mangaDownload(from, r)
+    } else if (p.kind === 'tiktok') {
+      const r = p.results[parseInt(t, 10) - 1]
+      if (!r) return sendMessage(from, `Choisis un numéro entre 1 et ${p.results.length}.`)
+      pending.delete(from)
+      return tiktokDownload(from, r)
     } else {
       const r = p.results[parseInt(t, 10) - 1]
       if (r) return downloadAndSend(from, r.url, r.title)
@@ -121,6 +130,14 @@ export async function handleMessage(from, text) {
     const q = mangaMatch[1].trim()
     if (!q) return sendMessage(from, 'Quel manga ? Exemple : `m one piece` ou `m berserk`')
     return mangaFlow(from, q)
+  }
+
+  // --- 2d) TikTok : "tt mot-clé" / "tiktok mot-clé" (vidéos sans watermark) ---
+  const ttMatch = text.match(/^(?:tt|tiktok)\s+(.+)$/i)
+  if (ttMatch) {
+    const q = ttMatch[1].trim()
+    if (!q) return sendMessage(from, 'Quel TikTok ? Exemple : `tt naruto edit` ou `tt danse`')
+    return tiktokFlow(from, q)
   }
 
   // --- 3) Anime VF : "a nom" / "anime nom" (recherche YouTube avec VF) ----
@@ -369,6 +386,57 @@ async function mangaDownload(from, it) {
     return sendMessage(from, `⚠️ Envoi impossible : ${e.message}`)
   }
   vfClean([file])
+}
+
+// --- TikTok (X69X API, sans watermark) ----------------------------------------
+function fmtCount(n) {
+  if (!n && n !== 0) return ''
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`
+  return String(n)
+}
+
+async function tiktokFlow(from, q) {
+  try {
+    await sendMessage(from, `🎵 Recherche TikTok « ${q} »…`)
+  } catch {}
+  let items
+  try {
+    items = await tiktokSearch(q)
+  } catch (e) {
+    return sendMessage(from, `⚠️ Recherche TikTok impossible : ${e.message}`)
+  }
+  const top = items.slice(0, 8)
+  const lines = top.map((v, i) => {
+    const st = v.stats || {}
+    const likes = st.likes ? `❤️ ${fmtCount(st.likes)}` : ''
+    return `${i + 1}. @${v.author || '?'} — ${v.title.slice(0, 70) || '(sans titre)'}\n   ${likes}${st.shares ? ` • 🔁${fmtCount(st.shares)}` : ''}`
+  })
+  pending.set(from, { kind: 'tiktok', results: top, ts: Date.now() })
+  await sendMessage(from, `🎵 Résultats TikTok pour « ${q} » :\n\n${lines.join('\n')}\n\nRéponds avec le numéro (1-${top.length}) pour le télécharger (sans watermark). ⏱️ (valable 10 min)`)
+}
+
+async function tiktokDownload(from, v) {
+  try {
+    await sendMessage(from, `⏳ Téléchargement du TikTok @${v.author || '?'}…`)
+  } catch {}
+  const dest = path.join(DL_DIR, `tiktok-${Date.now()}.mp4`)
+  let size = 0
+  try {
+    size = await downloadTo(v.videoUrl, dest)
+  } catch (e) {
+    try { fs.rmSync(dest, { force: true }) } catch {}
+    return sendMessage(from, `⚠️ Téléchargement TikTok échoué : ${e.message}`)
+  }
+  const mo = Math.round(size / 1048576)
+  try {
+    if (size <= VIDEO_LIMIT) await sendVideo(from, dest, `@${v.author} — ${v.title}`)
+    else await sendDocument(from, dest, 'video/mp4', `@${v.author} — ${v.title}\n\n📎 Vidéo TikTok sans watermark (${mo} Mo)`)
+  } catch (e) {
+    try { fs.rmSync(dest, { force: true }) } catch {}
+    return sendMessage(from, `⚠️ Envoi impossible : ${e.message}`)
+  }
+  try { fs.rmSync(dest, { force: true }) } catch {}
 }
 
 const MIME_BY_EXT = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/x-m4v' }
