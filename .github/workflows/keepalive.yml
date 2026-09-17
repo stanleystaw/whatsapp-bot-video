@@ -1,0 +1,17 @@
+name: keepalive
+
+# Réveille le bot toutes les 5 minutes pour empêcher Render (plan gratuit)
+# de mettre le service en sommeil → plus de coupures "à l'improviste".
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping le bot
+        run: |
+          curl -sf --max-time 45 https://whatsapp-bot-3dx8.onrender.com/ping
+          echo "✅ bot éveillé"

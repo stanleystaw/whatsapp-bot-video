@@ -38,6 +38,15 @@ function guard(req, res, next) {
 }
 
 // ---------------------------------------------------------------------
+// /ping : endpoint public ultra-léger — gardien d'éveil (keep-alive).
+// Le cron externe l'appelle toutes les 5 min pour empêcher Render de
+// mettre le service en sommeil (c'est ce qui causait les coupures).
+// ---------------------------------------------------------------------
+app.get('/ping', (req, res) => {
+  res.json({ ok: true, t: Date.now() })
+})
+
+// ---------------------------------------------------------------------
 // /status : diagnostic JSON (pour savoir exactement ce qui bloque)
 // ---------------------------------------------------------------------
 app.get('/status', guard, (req, res) => {
