@@ -11,7 +11,14 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping le bot
+      - name: Ping le bot (avec retents)
         run: |
-          curl -sf --max-time 45 https://whatsapp-bot-3dx8.onrender.com/ping
-          echo "✅ bot éveillé"
+          for i in 1 2 3 4; do
+            if curl -sf --max-time 45 https://whatsapp-bot-3dx8.onrender.com/ping; then
+              echo "✅ bot éveillé (tentative $i)"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "❌ bot injoignable après 4 tentatives"
+          exit 1
