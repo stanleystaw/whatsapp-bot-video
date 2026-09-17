@@ -47,9 +47,10 @@ function parseSize(s) {
 }
 
 // --- Recherche nyaa (RSS, pas d'auth) -----------------------------------------
-export async function vfSearch(query) {
-  const url = 'https://nyaa.si/?page=rss&q=' + encodeURIComponent(query)
-  const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml, */*' } })
+// cat: '1_3' anime, '2_1' manga, '2_2' manhwa, '2_3' manhua, '3_1' mangas EN, '3_2' mangas FR, '' = toutes
+export async function vfSearch(query, cat = '') {
+  const url = 'https://nyaa.si/?page=rss&q=' + encodeURIComponent(query) + (cat ? '&c=' + cat : '')
+  const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml, */*' }, signal: AbortSignal.timeout(30_000) })
   if (!res.ok) throw new Error(`nyaa HTTP ${res.status}`)
   const xml = await res.text()
   const items = []
@@ -152,8 +153,9 @@ export function vfDownload(torrentUrl, onStatus, timeoutMs = VF_TIMEOUT_MS) {
       const ctrl = files.find((f) => f.endsWith('.aria2'))
       const data = files.find((f) => !f.endsWith('.aria2'))
       if (!ctrl && data) {
+        // le fichier .aria2 (contrôle) est supprimé par aria2 à la fin → téléchargement terminé
         const p = path.join(DL_DIR, data)
-        try { if (fs.statSync(p).size > 10 * 1024 * 1024) finish(resolve, null, p) } catch {}
+        try { if (fs.statSync(p).size > 0) finish(resolve, null, p) } catch {}
       } else if (ctrl && onStatus) {
         try {
           const st = fs.statSync(path.join(DL_DIR, ctrl))

@@ -4,6 +4,7 @@ import { sendMessage, sendVideo, sendDocument } from './whatsapp.js'
 import { searchVideos, downloadVideo, downloadHls, VIDEO_LIMIT, DL_DIR } from './downloader.js'
 import { anipubSearch, anipubEpisodeId, anipubResolveMedia, anipubBuildPlaylist } from './anipub.js'
 import { vfPick, vfDownload, vfMakeFrench, vfClean, VF_MAX_MB } from './vf.js'
+import { mangaSearch, mangaRank } from './manga.js'
 
 // Recherches en attente : jid -> { results, ts } (expirées après 10 min)
 const pending = new Map()
@@ -31,6 +32,9 @@ function helpText() {
     '',
     '• **Anime VRAIE VF** : `vf nom [sXXeYY]` → je télécharge l\'épisode dublé (nyaa)',
     '  Ex : `vf demon slayer s04e11` ou `vf demon slayer 11`',
+    '',
+    '• **Mangas** : `m nom` → je liste les mangas dispo (VF/EN), tu choisis le n°',
+    '  Ex : `m one piece` puis `1` (taille, seeders et langue affichés)',
     '',
     '• **Anime VF** : `a nom` → je cherche les épisodes sur YouTube',
     '  Ex : `a one piece` puis `3`',
@@ -83,6 +87,11 @@ export async function handleMessage(from, text) {
       if (!r.epCount || r.epCount <= 1) return anipubTryDownload(from, r.finder || String(r.id), 1, r.name)
       pending.set(from, { kind: 'anipub-ep', finder: r.finder, name: r.name, epCount: r.epCount, ts: Date.now() })
       return sendMessage(from, `🎌 ${r.name} — ${r.epCount} épisodes.\nQuel numéro d'épisode veux-tu ? (ex : 1)`)
+    } else if (p.kind === 'manga') {
+      const r = p.results[parseInt(t, 10) - 1]
+      if (!r) return sendMessage(from, `Choisis un numéro entre 1 et ${p.results.length}.`)
+      pending.delete(from)
+      return mangaDownload(from, r)
     } else {
       const r = p.results[parseInt(t, 10) - 1]
       if (r) return downloadAndSend(from, r.url, r.title)
@@ -104,6 +113,14 @@ export async function handleMessage(from, text) {
     const q = vfMatch[1].trim()
     if (!q) return sendMessage(from, 'Quel anime ? Exemple : `vf demon slayer s04e11` ou `vf demon slayer 11`')
     return vfFlow(from, q)
+  }
+
+  // --- 2c) Mangas : "m nom" / "manga nom" (nyaa, VF + EN) ---
+  const mangaMatch = text.match(/^(?:m|manga)\s+(.+)$/i)
+  if (mangaMatch) {
+    const q = mangaMatch[1].trim()
+    if (!q) return sendMessage(from, 'Quel manga ? Exemple : `m one piece` ou `m berserk`')
+    return mangaFlow(from, q)
   }
 
   // --- 3) Anime VF : "a nom" / "anime nom" (recherche YouTube avec VF) ----
@@ -296,6 +313,62 @@ async function vfFlow(from, q) {
     return sendMessage(from, `⚠️ Envoi impossible : ${e.message}`)
   }
   vfClean([file, finalFile === file ? null : file])
+}
+
+// --- Mangas (nyaa) -------------------------------------------------------------
+const MANGA_MIME = { pdf: 'application/pdf', cbz: 'application/zip', epub: 'application/epub+zip', zip: 'application/zip', rar: 'application/vnd.rar' }
+
+async function mangaFlow(from, q) {
+  try {
+    await sendMessage(from, `📚 Recherche du manga « ${q} » sur nyaa…`)
+  } catch {}
+  let items
+  try {
+    items = await mangaSearch(q)
+  } catch (e) {
+    return sendMessage(from, `⚠️ Recherche impossible : ${e.message}`)
+  }
+  const ranked = mangaRank(items).filter((x) => x.it.seeds > 0 || x.it.leech > 0).slice(0, 8)
+  if (!ranked.length) {
+    const any = mangaRank(items).slice(0, 3)
+    const extra = any.length
+      ? `\n\nExiste mais sans seeder pour l'instant :\n${any.map((a) => `• ${a.it.title.slice(0, 90)}`).join('\n')}`
+      : ''
+    return sendMessage(from, `❌ Rien de téléchargeable pour « ${q} ».\nEssaie le nom en anglais (ex : m one piece) ou un autre titre.${extra}`)
+  }
+  const lines = ranked.map((x, i) => {
+    const mo = Math.round(x.it.size / 1048576)
+    const attr = [x.lang ? `[${x.lang}]` : null, x.fmt || null, `${mo} Mo`, `🔻${x.it.seeds}`].filter(Boolean).join(' • ')
+    return `${i + 1}. ${x.it.title.slice(0, 85)}\n   ${attr}`
+  })
+  pending.set(from, { kind: 'manga', results: ranked.map((x) => x.it), ts: Date.now() })
+  await sendMessage(from, `📚 Résultats pour « ${q} » :\n\n${lines.join('\n')}\n\nRéponds avec le numéro (1-${ranked.length}) pour télécharger. ⏱️ (valable 10 min)`)
+}
+
+async function mangaDownload(from, it) {
+  try {
+    await sendMessage(from, `⏳ Téléchargement :\n${it.title}\n(${Math.round(it.size / 1048576)} Mo, seeders : ${it.seeds})`)
+  } catch {}
+  let file = null
+  try {
+    file = await vfDownload(it.link)
+  } catch (e) {
+    vfClean([file])
+    return sendMessage(from, `⚠️ Téléchargement échoué : ${e.message}\nPeu de seeders — retente plus tard.`)
+  }
+  const sz = fs.statSync(file).size
+  if (sz > 480 * 1024 * 1024) {
+    vfClean([file])
+    return sendMessage(from, `⚠️ Fichier de ${Math.round(sz / 1048576)} Mo, trop gros pour WhatsApp.`)
+  }
+  const ext = path.extname(file).slice(1).toLowerCase()
+  try {
+    await sendDocument(from, file, MANGA_MIME[ext] || 'application/octet-stream', `${it.title}\n\n📎 Manga (${Math.round(sz / 1048576)} Mo) — appuie dessus pour le télécharger.`)
+  } catch (e) {
+    vfClean([file])
+    return sendMessage(from, `⚠️ Envoi impossible : ${e.message}`)
+  }
+  vfClean([file])
 }
 
 const MIME_BY_EXT = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/x-m4v' }
